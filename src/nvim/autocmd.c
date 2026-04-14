@@ -1652,6 +1652,21 @@ bool trigger_cursorhold(void) FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT
 bool apply_autocmds_group(event_T event, char *fname, char *fname_io, bool force, int group,
                           buf_T *buf, exarg_T *eap, Object *data)
 {
+  return apply_autocmds_group_impl(event, fname, fname_io, force, group, buf, eap, data, false);
+}
+
+/// Like apply_autocmds_group() but switches to `buf`'s context after matching,
+/// so callbacks (and modelines) run with `buf` as curbuf.
+bool apply_autocmds_group_bufcontext(event_T event, char *fname, char *fname_io, bool force,
+                                     int group, buf_T *buf, exarg_T *eap, Object *data)
+{
+  return apply_autocmds_group_impl(event, fname, fname_io, force, group, buf, eap, data, true);
+}
+
+static bool apply_autocmds_group_impl(event_T event, char *fname, char *fname_io, bool force,
+                                      int group, buf_T *buf, exarg_T *eap, Object *data,
+                                      bool use_buf_context)
+{
   char *sfname = NULL;  // short file name
   bool retval = false;
   static int nesting = 0;
@@ -1662,6 +1677,10 @@ bool apply_autocmds_group(event_T event, char *fname, char *fname_io, bool force
   save_redo_T save_redo;
   const bool save_KeyTyped = KeyTyped;
   ESTACK_CHECK_DECLARATION;
+  aco_save_T aco;
+  bool did_prepbuf = false;
+  bool save_changed = false;
+  buf_T *old_curbuf = NULL;
 
   // Quickly return if there are no autocommands for this event or
   // autocommands are blocked.
@@ -1731,9 +1750,6 @@ bool apply_autocmds_group(event_T event, char *fname, char *fname_io, bool force
   char *save_autocmd_match = autocmd_match;
   int save_autocmd_busy = autocmd_busy;
   int save_autocmd_nested = autocmd_nested;
-  bool save_changed = curbuf->b_changed;
-  buf_T *old_curbuf = curbuf;
-
   // Set the file name to be used for <afile>.
   // Make a copy to avoid that changing a buffer name or directory makes it
   // invalid.
@@ -1829,6 +1845,14 @@ bool apply_autocmds_group(event_T event, char *fname, char *fname_io, bool force
     retval = false;
     goto BYPASS_AU;
   }
+
+  if (use_buf_context && buf != NULL && buf != curbuf) {
+    aucmd_prepbuf(&aco, buf);
+    did_prepbuf = true;
+  }
+
+  save_changed = curbuf->b_changed;
+  old_curbuf = curbuf;
 
 #ifdef BACKSLASH_IN_FILENAME
   // Replace all backslashes with forward slashes. This makes the
@@ -2021,6 +2045,10 @@ BYPASS_AU:
 
   if (retval == OK && event == EVENT_FILETYPE) {
     curbuf->b_au_did_filetype = true;
+  }
+
+  if (did_prepbuf) {
+    aucmd_restbuf(&aco);
   }
 
   return retval;

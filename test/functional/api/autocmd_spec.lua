@@ -1205,6 +1205,82 @@ describe('autocmd api', function()
       eq(1, api.nvim_get_var('buffer_executed'))
     end)
 
+    it('executes in target buf context for one visible window', function()
+      local caller = api.nvim_get_current_buf()
+      local caller_win = api.nvim_get_current_win()
+      command('split')
+      local target = api.nvim_create_buf(true, false)
+      api.nvim_set_current_buf(target)
+      local target_win = api.nvim_get_current_win()
+      command('wincmd j')
+
+      api.nvim_create_autocmd('CursorHold', {
+        buffer = target,
+        command = 'let [g:abuf, g:cur, g:win] = [str2nr(expand("<abuf>")), bufnr("%"), win_getid()]',
+      })
+      api.nvim_exec_autocmds('CursorHold', { buf = target })
+
+      eq(target, api.nvim_get_var('abuf'))
+      eq(target, api.nvim_get_var('cur'))
+      eq(target_win, api.nvim_get_var('win'))
+      eq(caller, api.nvim_get_current_buf())
+      eq(caller_win, api.nvim_get_current_win())
+    end)
+
+    it('executes in target buf context for a hidden buffer', function()
+      local caller = api.nvim_get_current_buf()
+      local target = api.nvim_create_buf(true, false)
+
+      api.nvim_create_autocmd('User', {
+        buffer = target,
+        command = 'let [g:abuf, g:cur] = [str2nr(expand("<abuf>")), bufnr("%")]',
+      })
+      api.nvim_exec_autocmds('User', { buf = target })
+
+      eq(target, api.nvim_get_var('abuf'))
+      eq(target, api.nvim_get_var('cur'))
+      eq(caller, api.nvim_get_current_buf())
+    end)
+
+    it('processes modelines in target buf context', function()
+      local target = api.nvim_create_buf(true, false)
+      api.nvim_buf_set_lines(target, 0, -1, false, { 'x', '/* vim: set textwidth=17: */' })
+
+      api.nvim_create_autocmd('User', { buffer = target, command = '' })
+      api.nvim_exec_autocmds('User', { buf = target })
+
+      eq(17, api.nvim_get_option_value('textwidth', { buf = target }))
+    end)
+
+    it('respects eventignorewin across multiple windows', function()
+      local caller_win = api.nvim_get_current_win()
+      local target = api.nvim_create_buf(false, false)
+      command('split')
+      api.nvim_set_current_buf(target)
+      command('vsplit')
+      local w_allows = api.nvim_get_current_win()
+      command('wincmd l')
+      local w_ignores = api.nvim_get_current_win()
+      command('wincmd j')
+
+      api.nvim_create_autocmd('CursorHold', {
+        buffer = target,
+        command = 'let g:fired += 1',
+      })
+      api.nvim_set_option_value('eventignorewin', '', { win = w_allows })
+      api.nvim_set_option_value('eventignorewin', 'CursorHold', { win = w_ignores })
+
+      api.nvim_set_var('fired', 0)
+      api.nvim_exec_autocmds('CursorHold', { buf = target })
+      eq(1, api.nvim_get_var('fired'))
+
+      api.nvim_set_option_value('eventignorewin', 'CursorHold', { win = w_allows })
+      api.nvim_set_var('fired', 0)
+      api.nvim_exec_autocmds('CursorHold', { buf = target })
+      eq(0, api.nvim_get_var('fired'))
+      eq(caller_win, api.nvim_get_current_win())
+    end)
+
     it('can pass the filename, pattern match', function()
       api.nvim_set_var('filename_executed', 'none')
       eq('none', api.nvim_get_var('filename_executed'))

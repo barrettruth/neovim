@@ -23,6 +23,7 @@
 #include "nvim/lua/executor.h"
 #include "nvim/memory.h"
 #include "nvim/memory_defs.h"
+#include "nvim/option.h"
 #include "nvim/strings.h"
 #include "nvim/types_defs.h"
 #include "nvim/vim_defs.h"
@@ -694,6 +695,7 @@ void nvim_exec_autocmds(Object event, Dict(exec_autocmds) *opts, Arena *arena, E
   bool modeline = true;
 
   buf_T *b = curbuf;
+  bufref_T bufref;
 
   Object *data = NULL;
 
@@ -741,6 +743,8 @@ void nvim_exec_autocmds(Object event, Dict(exec_autocmds) *opts, Arena *arena, E
     if (ERROR_SET(err)) {
       return;
     }
+
+    set_bufref(&bufref, b);
   }
 
   Array patterns = get_patterns_from_pattern_or_buf(opts->pattern, has_buf, buf, "",
@@ -761,12 +765,24 @@ void nvim_exec_autocmds(Object event, Dict(exec_autocmds) *opts, Arena *arena, E
 
     FOREACH_ITEM(patterns, pat, {
       char *fname = !has_buf ? pat.data.string.data : NULL;
-      did_aucmd |= apply_autocmds_group(event_nr, fname, NULL, true, au_group, b, NULL, data);
+      did_aucmd |= has_buf
+                   ? apply_autocmds_group_bufcontext(event_nr, fname, NULL, true, au_group, b,
+                                                     NULL, data)
+                   : apply_autocmds_group(event_nr, fname, NULL, true, au_group, b, NULL, data);
     })
   })
 
   if (did_aucmd && modeline) {
-    do_modelines(0);
+    if (has_buf) {
+      if (bufref_valid(&bufref) && bufref.br_buf->b_ml.ml_mfp != NULL) {
+        aco_save_T aco;
+        aucmd_prepbuf(&aco, bufref.br_buf);
+        do_modelines(is_aucmd_win(curwin) ? OPT_NOWIN : 0);
+        aucmd_restbuf(&aco);
+      }
+    } else {
+      do_modelines(0);
+    }
   }
 }
 
