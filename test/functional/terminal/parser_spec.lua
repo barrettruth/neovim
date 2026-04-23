@@ -94,19 +94,15 @@ describe(':terminal', function()
   end)
 
   it('does not leak pending TermRequest on buffer destroy #39332', function()
-    local buf = api.nvim_create_buf(false, true)
-    local chan = api.nvim_open_term(buf, {})
-    exec_lua(function(b)
-      vim.api.nvim_create_autocmd('TermRequest', { buffer = b, callback = function() end })
-    end, buf)
-    -- Two back-to-back OSC 7 sequences: the second overwrites `term->pending.send`,
-    -- orphaning the first StringBuilder (only referenced from the queued emit).
-    api.nvim_chan_send(chan, OSC_PREFIX .. '7;file:///a' .. ST)
-    api.nvim_chan_send(chan, OSC_PREFIX .. '7;file:///b' .. ST)
-    -- `terminal_destroy` used to free only the current `term->pending.send`;
-    -- the orphan then hit the early return in `emit_termrequest` which freed
-    -- `sequence` but leaked `pending_send`. ASan/LSan CI catches this.
-    api.nvim_buf_delete(buf, { force = true })
+    -- Send all OSC sequences in one exec_lua so that the event loop does not drain between the sends.
+    exec_lua(function(prefix, st)
+      local buf = vim.api.nvim_create_buf(false, true)
+      local chan = vim.api.nvim_open_term(buf, {})
+      vim.api.nvim_create_autocmd('TermRequest', { buffer = buf, callback = function() end })
+      vim.api.nvim_chan_send(chan, prefix .. '7;file:///a' .. st)
+      vim.api.nvim_chan_send(chan, prefix .. '7;file:///b' .. st)
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end, OSC_PREFIX, ST)
     assert_alive()
   end)
 end)
