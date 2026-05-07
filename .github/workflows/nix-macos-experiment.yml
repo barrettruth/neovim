@@ -1,0 +1,334 @@
+name: nix macos experiment
+
+on:
+  push:
+    branches:
+      - ci/nix-cachix-experiment
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ASAN_OPTIONS: detect_leaks=1:check_initialization_order=1:log_path=${{ github.workspace }}/build/log/asan:intercept_tls_get_addr=0
+  BIN_DIR: ${{ github.workspace }}/bin
+  BUILD_DIR: ${{ github.workspace }}/build
+  CACHIX_CACHE_NAME: ${{ vars.CACHIX_CACHE_NAME || 'nix-community' }}
+  INSTALL_PREFIX: ${{ github.workspace }}/nvim-install
+  LOG_DIR: ${{ github.workspace }}/build/log
+  NVIM_LOG_FILE: ${{ github.workspace }}/build/nvim.log
+  TSAN_OPTIONS: log_path=${{ github.workspace }}/build/log/tsan
+  VALGRIND_LOG: ${{ github.workspace }}/build/log/valgrind-%p.log
+
+jobs:
+  brew-current-setup:
+    name: brew current setup (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-15-intel
+          - macos-26
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Measure current install_deps.sh --test
+        run: |
+          set -euo pipefail
+
+          metric() {
+            printf 'METRIC %s=%s\n' "$1" "$2"
+          }
+
+          measure() {
+            local name="$1"
+            shift
+            local start end rc
+
+            start="$(date -u +%s)"
+            echo "::group::$name"
+            set +e
+            "$@"
+            rc="$?"
+            set -e
+            echo "::endgroup::"
+            end="$(date -u +%s)"
+
+            metric "${name}_seconds" "$((end - start))"
+            metric "${name}_rc" "$rc"
+            return "$rc"
+          }
+
+          metric runner_name "${{ matrix.runner }}"
+          metric disk_available_kb_before "$(df -Pk . | awk 'NR == 2 { print $4 }')"
+          brew_log="$RUNNER_TEMP/brew-install-deps.log"
+          run_brew_install_deps() {
+            set +e
+            ./.github/scripts/install_deps.sh --test 2>&1 | tee "$brew_log"
+            local rc="${PIPESTATUS[0]}"
+            set -e
+            return "$rc"
+          }
+
+          measure brew_install_deps run_brew_install_deps || true
+          metric brew_http_403_count "$(grep -Ec '(^|[^0-9])403([^0-9]|$)|HTTP 403|status code 403|requested URL returned error: 403' "$brew_log" || true)"
+          metric brew_fetch_error_count "$(grep -Ec 'fatal:|error: RPC failed|Failed to download resource|download failed|fetch-pack' "$brew_log" || true)"
+          metric disk_available_kb_after "$(df -Pk . | awk 'NR == 2 { print $4 }')"
+
+  nix-unittest:
+    name: nix cachix unittest (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-15-intel
+          - macos-26
+    env:
+      CC: clang
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Runner inventory
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -a
+          sysctl -n hw.ncpu
+          df -h
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31.10.6
+        with:
+          github_access_token: ${{ github.token }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Probe Cachix cache
+        run: |
+          set -euo pipefail
+          status="$(curl -sS -o /dev/null -w '%{http_code}' "https://${CACHIX_CACHE_NAME}.cachix.org" || true)"
+          printf 'METRIC cachix_cache=%s\n' "${CACHIX_CACHE_NAME}"
+          printf 'METRIC cachix_cache_http_status=%s\n' "$status"
+
+      - name: Configure Cachix
+        uses: cachix/cachix-action@v17
+        continue-on-error: true
+        with:
+          name: ${{ env.CACHIX_CACHE_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: ${{ secrets.CACHIX_AUTH_TOKEN == '' }}
+
+      - name: Build and test through Nix shell
+        run: |
+          set -euo pipefail
+
+          metric() {
+            printf 'METRIC %s=%s\n' "$1" "$2"
+          }
+
+          store_bytes() {
+            du -sk /nix/store 2>/dev/null | awk '{ print $1 * 1024 }'
+          }
+
+          measure() {
+            local name="$1"
+            shift
+            local start end rc
+
+            start="$(date -u +%s)"
+            echo "::group::$name"
+            set +e
+            "$@"
+            rc="$?"
+            set -e
+            echo "::endgroup::"
+            end="$(date -u +%s)"
+
+            metric "${name}_seconds" "$((end - start))"
+            metric "${name}_rc" "$rc"
+            return "$rc"
+          }
+
+          develop=(nix develop ./ci/nix#macos-ci -c bash)
+
+          metric runner_name "${{ matrix.runner }}"
+          metric nix_version "$(nix --version | tr ' ' '_')"
+          metric disk_available_kb_before "$(df -Pk . | awk 'NR == 2 { print $4 }')"
+          metric nix_store_bytes_before "$(store_bytes)"
+
+          mkdir -p "$RUNNER_TEMP/nix-metrics"
+          probe_script="$RUNNER_TEMP/nix-metrics/probe.sh"
+          deps_script="$RUNNER_TEMP/nix-metrics/cmake-deps.sh"
+          build_script="$RUNNER_TEMP/nix-metrics/cmake-build.sh"
+          unittest_script="$RUNNER_TEMP/nix-metrics/unittest.sh"
+          install_script="$RUNNER_TEMP/nix-metrics/install-smoke.sh"
+
+          cat > "$probe_script" <<'SCRIPT'
+          set -euo pipefail
+          cmake --version >/dev/null
+          ninja --version >/dev/null
+          msgfmt --version >/dev/null
+          make --version >/dev/null
+          fish --version >/dev/null
+          fswatch --version >/dev/null
+          python3 -c 'import pynvim'
+          neovim-node-host --version >/dev/null
+          node -e 'require("neovim"); console.log("node-neovim-ok")' >/dev/null
+          perl -W -e 'use Neovim::Ext; print $Neovim::Ext::VERSION'
+          if command -v neovim-ruby-host >/dev/null; then
+            neovim-ruby-host --version >/dev/null
+          fi
+          SCRIPT
+
+          cat > "$deps_script" <<'SCRIPT'
+          set -euo pipefail
+          cmake -S cmake.deps --preset ci -D CMAKE_BUILD_TYPE=Debug -D CMAKE_FIND_FRAMEWORK=NEVER
+          cmake --build .deps
+          SCRIPT
+
+          cat > "$build_script" <<'SCRIPT'
+          set -euo pipefail
+          cmake --preset ci -D CMAKE_BUILD_TYPE=Debug -D CMAKE_INSTALL_PREFIX:PATH="$INSTALL_PREFIX" -D CMAKE_FIND_FRAMEWORK=NEVER
+          cmake --build build
+          SCRIPT
+
+          cat > "$unittest_script" <<'SCRIPT'
+          set -euo pipefail
+          cmake --build build --target unittest
+          SCRIPT
+
+          cat > "$install_script" <<'SCRIPT'
+          set -euo pipefail
+          cmake --install build
+          "$INSTALL_PREFIX/bin/nvim" -V1 --version
+          "$INSTALL_PREFIX/bin/nvim" -u NONE -e -c ':help' -c ':qall'
+          SCRIPT
+
+          chmod +x "$probe_script" "$deps_script" "$build_script" "$unittest_script" "$install_script"
+
+          run_nix_develop_cold() {
+            nix --log-format internal-json develop ./ci/nix#macos-ci -c bash "$probe_script" \
+              2> >(tee "$RUNNER_TEMP/nix-metrics/nix-develop-cold.raw" >&2)
+          }
+
+          measure nix_develop_cold run_nix_develop_cold
+          measure nix_develop_warm "${develop[@]}" "$probe_script"
+
+          mkdir -p "$LOG_DIR"
+
+          measure cmake_deps "${develop[@]}" "$deps_script"
+          measure cmake_build "${develop[@]}" "$build_script"
+          measure unittest "${develop[@]}" "$unittest_script"
+          measure install_smoke "${develop[@]}" "$install_script"
+
+          metric nix_store_bytes_after "$(store_bytes)"
+          metric disk_available_kb_after "$(df -Pk . | awk 'NR == 2 { print $4 }')"
+
+      - if: always()
+        name: Summarize Nix substitution metrics
+        run: |
+          set -euo pipefail
+
+          metric() {
+            printf 'METRIC %s=%s\n' "$1" "$2"
+          }
+
+          raw="$RUNNER_TEMP/nix-metrics/nix-develop-cold.raw"
+          jsonl="$RUNNER_TEMP/nix-metrics/nix-develop-cold.jsonl"
+          summary="$RUNNER_TEMP/nix-metrics/summary.json"
+
+          if [[ ! -s "$raw" ]]; then
+            metric nix_internal_json_events 0
+            exit 0
+          fi
+
+          awk '/^@nix / { sub(/^@nix /, ""); print }' "$raw" > "$jsonl"
+          metric nix_internal_json_events "$(wc -l < "$jsonl" | tr -d ' ')"
+
+          if [[ ! -s "$jsonl" ]]; then
+            exit 0
+          fi
+
+          CACHIX_CACHE="$CACHIX_CACHE_NAME" jq -sr '
+            reduce .[] as $e (
+              {
+                activity: {},
+                progress: {},
+                copy_path_bytes_by_id: {},
+                copy_path_source_by_id: {},
+                file_transfer_bytes_by_id: {}
+              };
+              if $e.action == "start" then
+                .activity[($e.id | tostring)] = $e.type
+                | if $e.type == 100 then
+                    .copy_path_source_by_id[($e.id | tostring)] = ($e.fields[1] // "")
+                  else . end
+              elif $e.action == "result" and $e.type == 105 then
+                ($e.id | tostring) as $id
+                | (.activity[$id] // null) as $atype
+                | if $atype == 104 then
+                    .progress.builds = $e.fields
+                  elif $atype == 103 then
+                    .progress.substitutions = $e.fields
+                  elif $atype == 100 then
+                    .copy_path_bytes_by_id[$id] = ([ (.copy_path_bytes_by_id[$id] // 0), ($e.fields[0] // 0) ] | max)
+                  elif $atype == 101 then
+                    .file_transfer_bytes_by_id[$id] = ([ (.file_transfer_bytes_by_id[$id] // 0), ($e.fields[0] // 0) ] | max)
+                  else . end
+              else . end
+            ) as $s
+            | ($ENV.CACHIX_CACHE // "") as $cache
+            | {
+                local_build_count: ($s.progress.builds[0] // 0),
+                substituted_path_count: ($s.progress.substitutions[0] // 0),
+                substituted_path_expected_total: ($s.progress.substitutions[1] // 0),
+                substitution_failed_count: ($s.progress.substitutions[3] // 0),
+                copied_nar_bytes: ([$s.copy_path_bytes_by_id[]] | add // 0),
+                cachix_copied_path_count: ([
+                  $s.copy_path_source_by_id
+                  | to_entries[]
+                  | select($cache != "" and (.value | contains($cache + ".cachix.org")))
+                ] | length),
+                cachix_copied_nar_bytes: ([
+                  $s.copy_path_bytes_by_id
+                  | to_entries[]
+                  | select(.key as $id | ($cache != "" and (($s.copy_path_source_by_id[$id] // "") | contains($cache + ".cachix.org"))))
+                  | .value
+                ] | add // 0),
+                file_transfer_body_bytes: ([$s.file_transfer_bytes_by_id[]] | add // 0)
+              }
+          ' "$jsonl" | tee "$summary"
+
+          jq -r 'to_entries[] | "METRIC nix_\(.key)=\(.value)"' "$summary"
+
+          {
+            echo "### Nix/Cachix metrics"
+            echo
+            echo '```json'
+            cat "$summary"
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - if: always()
+        name: Upload logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: nix-macos-${{ matrix.runner }}-logs
+          path: |
+            build/log
+            build/nvim.log
+          if-no-files-found: ignore
