@@ -79,7 +79,7 @@ jobs:
           }
 
           measure brew_install_deps run_brew_install_deps || true
-          metric brew_http_403_count "$(grep -Ec '(^|[^0-9])403([^0-9]|$)|HTTP 403|status code 403|requested URL returned error: 403' "$brew_log" || true)"
+          metric brew_http_403_count "$(grep -Ec 'HTTP[ /][0-9.]* 403|HTTP 403|status code 403|requested URL returned error: 403|fatal: unable to access .*403' "$brew_log" || true)"
           metric brew_fetch_error_count "$(grep -Ec 'fatal:|error: RPC failed|Failed to download resource|download failed|fetch-pack' "$brew_log" || true)"
           metric disk_available_kb_after "$(df -Pk . | awk 'NR == 2 { print $4 }')"
 
