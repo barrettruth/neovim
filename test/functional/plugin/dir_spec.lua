@@ -145,6 +145,9 @@ describe('nvim.dir', function()
   end)
 
   it('uses an absolute buffer name for a relative startup directory argument', function()
+    if t.is_zig_build() then
+      return pending('broken with build.zig relative runtime paths after chdir')
+    end
     make_fixture()
     local cwd = assert(vim.uv.cwd())
     assert(vim.uv.chdir(root))
@@ -239,6 +242,21 @@ describe('nvim.dir', function()
   end)
 
   it('displays filenames as buffer text and opens them from the buffer', function()
+    make_fixture()
+    n.clear({ args_rm = { '-u' } })
+
+    edit(root)
+    line_of('.hidden')
+    line_of('subdir/')
+    api.nvim_win_set_cursor(0, { line_of('alpha.txt'), 0 })
+    feed('<CR>')
+    poke_eventloop()
+
+    eq(file, api.nvim_buf_get_name(0))
+    eq({ 'alpha' }, lines())
+  end)
+
+  it('encodes special filename characters in directory buffers', function()
     -- Windows reserves backslash as a separator and disallows control characters in filenames.
     -- https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
     t.skip(t.is_os('win'), 'N/A: Windows filenames cannot contain these characters')
@@ -283,6 +301,9 @@ describe('nvim.dir', function()
   end)
 
   it('coexists with netrw and can be disabled', function()
+    if t.is_zig_build() then
+      return pending('broken with build.zig relative runtime paths after chdir')
+    end
     make_fixture()
     n.clear({ args_rm = { '-u' } })
     local cwd = fn.getcwd()
@@ -305,6 +326,9 @@ describe('nvim.dir', function()
   end)
 
   it('supports the FileExplorer browse contract', function()
+    if t.is_zig_build() then
+      return pending('broken with build.zig relative runtime paths after chdir')
+    end
     make_fixture()
     n.clear({ args_rm = { '-u' } })
     local cwd = fn.getcwd()
