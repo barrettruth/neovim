@@ -201,9 +201,6 @@ function first_open(buf, dir)
     end,
   })
   set_maps(buf)
-  if api.nvim_get_option_value('filetype', { buf = buf }) ~= 'directory' then
-    api.nvim_set_option_value('filetype', 'directory', { buf = buf })
-  end
 end
 
 ---@param buf integer

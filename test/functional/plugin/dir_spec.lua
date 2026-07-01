@@ -53,18 +53,19 @@ end
 
 ---@param args? string[]
 ---@return string[]
-local function with_buftype_optionset(args)
+local function with_filetype_event(args)
   return vim.list_extend({
+    '--clean',
     '--cmd',
     'let g:nvim_dir_events = []',
     '--cmd',
-    [[autocmd OptionSet buftype call add(g:nvim_dir_events, v:option_new)]],
+    [[autocmd FileType directory call add(g:nvim_dir_events, &filetype)]],
   }, args or {})
 end
 
-local function expect_buftype_optionset(path)
+local function expect_filetype_event(path)
   assert_directory(path)
-  eq({ 'nowrite' }, exec_lua('return vim.g.nvim_dir_events'))
+  eq({ 'directory' }, exec_lua('return vim.g.nvim_dir_events'))
 end
 
 describe('nvim.dir', function()
@@ -91,7 +92,7 @@ describe('nvim.dir', function()
 
   it('opens a startup directory argument', function()
     make_fixture()
-    n.clear({ args_rm = { '-u' }, args = { root } })
+    n.clear({ args_rm = { '-u' }, args = { '--clean', root } })
 
     assert_directory(root)
     eq(false, vim.tbl_contains(lines(), '../'))
@@ -100,53 +101,134 @@ describe('nvim.dir', function()
     line_of('alpha.txt')
   end)
 
-  it('triggers nested autocmds when opening directory buffers', function()
+  it('sets directory filetype without the runtime plugin', function()
     make_fixture()
+    n.clear()
 
-    n.clear({
-      args_rm = { '-u' },
-      args = with_buftype_optionset({ root }),
-    })
-    expect_buftype_optionset(root)
-
-    n.clear({
-      args_rm = { '-u' },
-      args = with_buftype_optionset(),
-    })
     edit(root)
-    expect_buftype_optionset(root)
+
+    eq(root, api.nvim_buf_get_name(0))
+    eq('directory', bufopt('filetype'))
+    eq(false, exec_lua([[return package.loaded['nvim.dir'] ~= nil]]))
   end)
 
-  it('handles nested autocmds deleting the directory buffer', function()
+  it('fires FileType before BufEnter when opening directories', function()
+    make_fixture()
+    n.clear({ args_rm = { '-u' }, args = { '--clean' } })
+    exec_lua(function()
+      _G.nvim_dir_events = {}
+      vim.api.nvim_create_autocmd({ 'FileType', 'BufEnter', 'BufWinEnter' }, {
+        callback = function(ev)
+          _G.nvim_dir_events[#_G.nvim_dir_events + 1] = ev.event .. ':' .. vim.bo[ev.buf].filetype
+        end,
+      })
+    end)
+
+    edit(root)
+
+    eq(
+      { 'FileType:directory', 'BufEnter:directory', 'BufWinEnter:directory' },
+      exec_lua('return _G.nvim_dir_events')
+    )
+  end)
+
+  it('fires FileType before VimEnter for startup directories', function()
     make_fixture()
     n.clear({
       args_rm = { '-u' },
       args = {
+        '--clean',
+        '--cmd',
+        [[lua _G.nvim_dir_events = {}; vim.api.nvim_create_autocmd('FileType', { pattern = 'directory', callback = function(ev) _G.nvim_dir_events[#_G.nvim_dir_events + 1] = ev.event .. ':' .. vim.bo[ev.buf].filetype end }); vim.api.nvim_create_autocmd('VimEnter', { callback = function(ev) _G.nvim_dir_events[#_G.nvim_dir_events + 1] = ev.event .. ':' .. vim.bo[ev.buf].filetype end })]],
+        root,
+      },
+    })
+
+    eq({ 'FileType:directory', 'VimEnter:directory' }, exec_lua('return _G.nvim_dir_events'))
+  end)
+
+  it('triggers user FileType autocmds when opening directory buffers', function()
+    make_fixture()
+
+    n.clear({
+      args_rm = { '-u' },
+      args = with_filetype_event({ root }),
+    })
+    expect_filetype_event(root)
+
+    n.clear({
+      args_rm = { '-u' },
+      args = with_filetype_event(),
+    })
+    edit(root)
+    expect_filetype_event(root)
+  end)
+
+  it('handles FileType autocmds deleting the directory buffer', function()
+    make_fixture()
+    n.clear({
+      args_rm = { '-u' },
+      args = {
+        '--clean',
         '--cmd',
         'let g:nvim_dir_wiped = 0',
         '--cmd',
-        [[autocmd OptionSet buftype let g:nvim_dir_wiped = 1 | bwipeout!]],
+        [[autocmd FileType directory let g:nvim_dir_wiped = 1 | bwipeout!]],
         root,
       },
     })
 
     eq(1, exec_lua('return vim.g.nvim_dir_wiped'))
-    eq('', exec_capture('messages'))
+    eq(false, exec_lua([[return package.loaded['nvim.dir'] ~= nil]]))
   end)
 
   it('does not load the module until opening a directory', function()
     make_fixture()
-    n.clear({ args_rm = { '-u' } })
+    n.clear({
+      args_rm = { '-u' },
+      args = {
+        '--clean',
+        '--cmd',
+        [[lua _G.nvim_dir_loaded_at_filetype = nil; vim.api.nvim_create_autocmd('FileType', { pattern = 'directory', callback = function() _G.nvim_dir_loaded_at_filetype = package.loaded['nvim.dir'] ~= nil end })]],
+      },
+    })
 
     eq(false, exec_lua([[return package.loaded['nvim.dir'] ~= nil]]))
     edit(root)
+    eq(false, exec_lua('return _G.nvim_dir_loaded_at_filetype'))
     eq(true, exec_lua([[return package.loaded['nvim.dir'] ~= nil]]))
     assert_directory(root)
   end)
 
+  it('lets a user FileType handler claim directory buffers', function()
+    make_fixture()
+    n.clear({
+      args_rm = { '-u' },
+      args = { '--clean', '--cmd', [[autocmd FileType directory setlocal buftype=nofile]] },
+    })
+
+    edit(root)
+
+    eq(root, api.nvim_buf_get_name(0))
+    eq('directory', bufopt('filetype'))
+    eq('nofile', bufopt('buftype'))
+    eq(false, exec_lua([[return package.loaded['nvim.dir'] ~= nil]]))
+  end)
+
+  it('does not classify directories added without loading', function()
+    make_fixture()
+    n.clear({ args_rm = { '-u' }, args = { '--clean' } })
+
+    command('badd ' .. fn.fnameescape(root))
+
+    local bufnr = fn.bufnr(root)
+    eq('', fn.getbufvar(bufnr, '&filetype'))
+    eq(false, exec_lua([[return package.loaded['nvim.dir'] ~= nil]]))
+  end)
+
   it('maps - to open the parent directory of the current file', function()
     make_fixture()
-    n.clear({ args_rm = { '-u' } })
+    n.clear({ args_rm = { '-u' }, args = { '--clean' } })
 
     edit(file)
     feed('-')
@@ -163,7 +245,7 @@ describe('nvim.dir', function()
     make_fixture()
     local cwd = assert(vim.uv.cwd())
     assert(vim.uv.chdir(root))
-    n.clear({ args_rm = { '-u' }, args = { '.' } })
+    n.clear({ args_rm = { '-u' }, args = { '--clean', '.' } })
     assert(vim.uv.chdir(cwd))
 
     assert_directory(root)
@@ -171,7 +253,7 @@ describe('nvim.dir', function()
 
   it('normalizes edited directory names', function()
     make_fixture()
-    n.clear({ args_rm = { '-u' } })
+    n.clear({ args_rm = { '-u' }, args = { '--clean' } })
 
     edit(root .. '///')
 
@@ -179,7 +261,7 @@ describe('nvim.dir', function()
   end)
 
   it('does not show a parent entry at the filesystem root', function()
-    n.clear({ args_rm = { '-u' } })
+    n.clear({ args_rm = { '-u' }, args = { '--clean' } })
     local root_dir = filesystem_root(fn.getcwd())
 
     edit(root_dir)
@@ -190,7 +272,7 @@ describe('nvim.dir', function()
 
   it('navigates entries and refreshes the listing', function()
     make_fixture()
-    n.clear({ args_rm = { '-u' } })
+    n.clear({ args_rm = { '-u' }, args = { '--clean' } })
 
     edit(root)
     assert_directory(root)
@@ -217,7 +299,7 @@ describe('nvim.dir', function()
 
   it("follows global 'hidden' when abandoned", function()
     make_fixture()
-    n.clear({ args_rm = { '-u' } })
+    n.clear({ args_rm = { '-u' }, args = { '--clean' } })
 
     command('set hidden')
 
@@ -229,7 +311,7 @@ describe('nvim.dir', function()
     eq(true, api.nvim_buf_is_loaded(root_buf))
     eq(1, fn.getbufinfo(root_buf)[1].hidden)
 
-    n.clear({ args_rm = { '-u' } })
+    n.clear({ args_rm = { '-u' }, args = { '--clean' } })
     command('set nohidden')
 
     edit(root)
@@ -269,7 +351,7 @@ describe('nvim.dir', function()
 
   it('reports an error and keeps the buffer when reloading a removed directory', function()
     make_fixture()
-    n.clear({ args_rm = { '-u' } })
+    n.clear({ args_rm = { '-u' }, args = { '--clean' } })
 
     edit(subdir)
     assert_directory(subdir)
@@ -284,7 +366,7 @@ describe('nvim.dir', function()
 
   it('refreshes a directory when navigated into again', function()
     make_fixture()
-    n.clear({ args_rm = { '-u' } })
+    n.clear({ args_rm = { '-u' }, args = { '--clean' } })
 
     edit(root)
     api.nvim_win_set_cursor(0, { line_of('subdir/'), 0 })
@@ -307,7 +389,7 @@ describe('nvim.dir', function()
 
   it('displays filenames as buffer text and opens them from the buffer', function()
     make_fixture()
-    n.clear({ args_rm = { '-u' } })
+    n.clear({ args_rm = { '-u' }, args = { '--clean' } })
 
     edit(root)
     line_of('.hidden')
@@ -325,7 +407,7 @@ describe('nvim.dir', function()
     -- https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
     t.skip(t.is_os('win'), 'N/A: Windows filenames cannot contain these characters')
     make_fixture()
-    n.clear({ args_rm = { '-u' } })
+    n.clear({ args_rm = { '-u' }, args = { '--clean' } })
 
     local name = 'line\nbreak.txt'
     local raw_names = {
@@ -354,14 +436,15 @@ describe('nvim.dir', function()
 
   it('leaves existing special buffers alone', function()
     make_fixture()
-    n.clear({ args_rm = { '-u' } })
+    n.clear({ args_rm = { '-u' }, args = { '--clean' } })
 
     api.nvim_set_option_value('buftype', 'nofile', { buf = 0 })
     api.nvim_buf_set_name(0, root)
-    command('doautocmd BufEnter')
+    api.nvim_set_option_value('filetype', 'directory', { buf = 0 })
 
     eq('nofile', api.nvim_get_option_value('buftype', { buf = 0 }))
-    eq('', api.nvim_get_option_value('filetype', { buf = 0 }))
+    eq('directory', api.nvim_get_option_value('filetype', { buf = 0 }))
+    eq(false, exec_lua([[return package.loaded['nvim.dir'] ~= nil]]))
   end)
 
   it('coexists with netrw', function()
@@ -369,7 +452,7 @@ describe('nvim.dir', function()
       return pending('broken with build.zig relative runtime paths after chdir')
     end
     make_fixture()
-    n.clear({ args_rm = { '-u' } })
+    n.clear({ args_rm = { '-u' }, args = { '--clean' } })
     local cwd = fn.getcwd()
 
     ok(fn.exists(':Explore') > 0)
@@ -387,7 +470,7 @@ describe('nvim.dir', function()
       return pending('broken with build.zig relative runtime paths after chdir')
     end
     make_fixture()
-    n.clear({ args_rm = { '-u' } })
+    n.clear({ args_rm = { '-u' }, args = { '--clean' } })
     local cwd = fn.getcwd()
 
     cd(root)
