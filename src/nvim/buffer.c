@@ -71,6 +71,7 @@
 #include "nvim/indent_c.h"
 #include "nvim/input.h"
 #include "nvim/insexpand.h"
+#include "nvim/lua/executor.h"
 #include "nvim/main.h"
 #include "nvim/map_defs.h"
 #include "nvim/mapping.h"
@@ -1974,6 +1975,15 @@ buf_T *buflist_new(char *ffname_arg, char *sfname_arg, linenr_T lnum, int flags)
   char *sfname = sfname_arg;
   buf_T *buf;
 
+  // A local "file:" URI is another spelling of a path: normalize it here, the
+  // only place buffers are created, so no other code needs to know about it.
+  char *uri_fname = (ffname != NULL && strncmp(ffname, "file:/", 6) == 0)
+                    ? nlua_uri_to_fname(ffname) : NULL;
+  if (uri_fname != NULL) {
+    ffname = uri_fname;
+    sfname = uri_fname;
+  }
+
   fname_expand(curbuf, &ffname, &sfname);       // will allocate ffname
 
   // If the file name already exists in the list, update the entry.
@@ -1985,6 +1995,7 @@ buf_T *buflist_new(char *ffname_arg, char *sfname_arg, linenr_T lnum, int flags)
   if (ffname != NULL && !(flags & (BLN_DUMMY | BLN_NEW))
       && (buf = buflist_findname_file_id(ffname, &file_id, file_id_valid)) != NULL) {
     xfree(ffname);
+    xfree(uri_fname);
     if (lnum != 0) {
       buflist_setfpos(buf, (flags & BLN_NOCURWIN) ? NULL : curwin,
                       lnum, 0, false);
@@ -2026,6 +2037,7 @@ buf_T *buflist_new(char *ffname_arg, char *sfname_arg, linenr_T lnum, int flags)
     buf_freeall(buf, BFA_WIPE | BFA_DEL);
     if (aborting()) {           // autocmds may abort script processing
       xfree(ffname);
+      xfree(uri_fname);
       return NULL;
     }
     if (!bufref_valid(&bufref)) {
@@ -2046,6 +2058,7 @@ buf_T *buflist_new(char *ffname_arg, char *sfname_arg, linenr_T lnum, int flags)
     buf->b_sfname = xstrdup(sfname);
     TO_SLASH(buf->b_sfname);
   }
+  xfree(uri_fname);
 
   clear_wininfo(buf);
   WinInfo *curwin_info = xcalloc(1, sizeof(WinInfo));

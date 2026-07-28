@@ -990,6 +990,18 @@ void nlua_init(char **argv, int argc, int lua_arg0)
   }
 #endif
 
+  // Lua now starts before "command_line_scan()", so find "--luamod-dev" here:
+  // "nlua_state_init()" needs it and cannot wait for the full scan.
+  for (int i = 1; i < argc; i++) {
+    if (strequal(argv[i], "--")) {
+      break;
+    }
+    if (strequal(argv[i], "--luamod-dev")) {
+      nlua_disable_preload = true;
+      break;
+    }
+  }
+
   lua_State *lstate = luaL_newstate();
   if (lstate == NULL) {
     fprintf(stderr, _("E970: Failed to initialize Lua interpreter\n"));
@@ -1009,6 +1021,44 @@ void nlua_init(char **argv, int argc, int lua_arg0)
   active_lstate = lstate;
   main_thread = uv_thread_self();
   nlua_init_argv(lstate, argv, argc, lua_arg0);
+}
+
+/// Populates _G.arg, after "command_line_scan()" has found "lua_arg0".
+void nlua_set_argv(char **argv, int argc, int lua_arg0)
+{
+  nlua_init_argv(global_lstate, argv, argc, lua_arg0);
+}
+
+/// Converts a local "file:" URI to a file name via `vim.uri_to_fname()`.
+///
+/// @param  uri  string to convert
+/// @return  [allocated] file name, or NULL if the conversion failed.
+char *nlua_uri_to_fname(const char *uri)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  lua_State *const L = global_lstate;
+  if (L == NULL) {
+    return NULL;
+  }
+
+  lua_getglobal(L, "require");
+  lua_pushstring(L, "vim.uri");
+  if (nlua_pcall(L, 1, 1)) {
+    lua_pop(L, 1);
+    return NULL;
+  }
+  lua_getfield(L, -1, "uri_to_fname");
+  lua_remove(L, -2);
+  lua_pushstring(L, uri);
+  if (nlua_pcall(L, 1, 1)) {
+    lua_pop(L, 1);
+    return NULL;
+  }
+
+  const char *fname = lua_tostring(L, -1);
+  char *ret = fname == NULL ? NULL : xstrdup(fname);
+  lua_pop(L, 1);
+  return ret;
 }
 
 static lua_State *nlua_thread_acquire_vm(void)

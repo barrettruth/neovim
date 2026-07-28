@@ -287,14 +287,18 @@ int main(int argc, char **argv)
   // Check if we have an interactive window.
   check_and_set_isatty(&params);
 
+  // Lua must be available before "command_line_scan()", which creates buffers
+  // for the file arguments and needs Lua to resolve "file:" URIs.
+  nlua_init(argv, argc, -1);
+  TIME_MSG("init lua interpreter");
+
   // Process the command line arguments.  File names are put in the global
   // argument list "global_alist".
   command_line_scan(&params);
 
-  set_argf_var();
+  nlua_set_argv(argv, argc, params.lua_arg0);
 
-  nlua_init(argv, argc, params.lua_arg0);
-  TIME_MSG("init lua interpreter");
+  set_argf_var();
 
   // On Windows, channel_from_stdio() replaces fd 2 with CONOUT$ (for ConPTY
   // support). Save a dup of the original stderr first so that if server_init()
