@@ -559,7 +559,7 @@ function M._check(eap)
     end)
   end)
 
-  local cancel_autocmd = vim.api.nvim_create_autocmd('BufWipeout', {
+  local cancel_autocmd = vim.api.nvim_create_autocmd('BufUnload', {
     buffer = bufnr,
     once = true,
     callback = function()
