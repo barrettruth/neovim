@@ -128,6 +128,55 @@ describe('autoread file watcher', function()
     end)
   end)
 
+  it('supports buffer-local providers', function()
+    local path = t.tmpname()
+    write_file(path, 'original\n')
+    command('enew')
+    api.nvim_buf_set_name(0, path .. '.buffer')
+    local bufnr = api.nvim_get_current_buf()
+
+    n.exec_lua(function(buf, watched_path)
+      _G.autoread_provider_calls = {}
+      require('nvim.autoread').register(buf, watched_path, {
+        refresh = function(refresh_buf, refresh_path)
+          table.insert(_G.autoread_provider_calls, { refresh_buf, refresh_path })
+        end,
+        watch = function(watch_path, callback)
+          _G.autoread_watch_path = watch_path
+          return vim._watch.watch(watch_path, {}, callback)
+        end,
+      })
+    end, bufnr, path)
+    eq(path, n.exec_lua('return _G.autoread_watch_path'))
+    eq(true, is_watching(bufnr))
+
+    write_file(path, 'changed\n')
+    retry(nil, 3000, function()
+      eq(
+        { bufnr, path },
+        n.exec_lua('return _G.autoread_provider_calls[#_G.autoread_provider_calls]')
+      )
+    end)
+
+    command('setlocal noautoread')
+    eq(false, is_watching(bufnr))
+    command('setlocal autoread')
+    eq(true, is_watching(bufnr))
+
+    command('set hidden')
+    command('enew')
+    eq(true, is_watching(bufnr))
+    command('bunload ' .. bufnr)
+    eq(false, is_watching(bufnr))
+    command('buffer ' .. bufnr)
+    eq(true, is_watching(bufnr))
+
+    n.exec_lua(function(buf)
+      require('nvim.autoread').unregister(buf)
+    end, bufnr)
+    eq(false, is_watching(bufnr))
+  end)
+
   it('handles file deletion gracefully', function()
     local path = open_watched('will be deleted\n')
 
