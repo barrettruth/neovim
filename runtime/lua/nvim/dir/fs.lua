@@ -7,6 +7,13 @@ local M = {}
 
 local navigating = false
 
+---@type nvim.autoread.Provider
+local autoread_provider = {
+  refresh = function(buf)
+    require('nvim.dir')._reload(buf)
+  end,
+}
+
 ---@param path string
 ---@return string
 function M.normalize(path)
@@ -109,6 +116,7 @@ function M.init(buf, path)
       magic = { file = false, bar = false },
     })
   end)
+  require('nvim.autoread').register(buf, path, autoread_provider)
 end
 
 return M

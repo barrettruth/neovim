@@ -12,6 +12,7 @@ local feed = n.feed
 local fn = n.fn
 local ok = t.ok
 local poke_eventloop = n.poke_eventloop
+local retry = t.retry
 
 local function lines()
   return api.nvim_buf_get_lines(0, 0, -1, true)
@@ -743,6 +744,22 @@ describe('nvim.dir', function()
     line_of('subdir/')
     line_of('alpha.txt')
     line_of('gamma.txt')
+  end)
+
+  it("reloads after external changes when 'autoread' is set", function()
+    make_fixture()
+    n.clear({ args = { '--clean' } })
+
+    edit(root)
+    command('setlocal autoread')
+    t.write_file(root .. '/beta.txt', 'beta', true)
+
+    retry(nil, 3000, function()
+      line_of('beta.txt')
+    end)
+
+    command('bwipeout!')
+    poke_eventloop()
   end)
 
   it('reports an error and keeps the buffer when reloading a removed directory', function()
