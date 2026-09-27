@@ -106,6 +106,162 @@ describe(':terminal window', function()
   end)
 end)
 
+describe(':terminal window after exit', function()
+  local screen
+  local text = ('0123456789'):rep(6)
+
+  before_each(function()
+    clear()
+    screen = Screen.new(20, 10)
+  end)
+
+  local function close_terminal(output)
+    local buf = api.nvim_get_current_buf()
+    local chan = api.nvim_open_term(buf, {})
+    api.nvim_chan_send(chan, output)
+    n.fn.chanclose(chan)
+    return buf
+  end
+
+  local function contents(buf)
+    return vim.tbl_filter(function(line)
+      return line ~= ''
+    end, api.nvim_buf_get_lines(buf, 0, -1, true))
+  end
+
+  it('reflows the retained screen and repositions the exit message', function()
+    command('let g:closed = 0 | autocmd TermClose * let g:closed += 1')
+    local buf = close_terminal(text .. '\r\n')
+    local ns = api.nvim_create_namespace('nvim.terminal.exitmsg')
+    local mark = api.nvim_buf_get_extmarks(buf, ns, 0, -1, {})[1][1]
+    eq({ text:sub(1, 20), text:sub(21, 40), text:sub(41) }, contents(buf))
+    screen:try_resize(70, 10)
+    retry(nil, nil, function()
+      eq({ text }, contents(buf))
+      eq({ 2, 0 }, api.nvim_buf_get_extmark_by_id(buf, ns, mark, {}))
+    end)
+    screen:try_resize(20, 10)
+    retry(nil, nil, function()
+      eq({ text:sub(1, 20), text:sub(21, 40), text:sub(41) }, contents(buf))
+      eq({ 4, 0 }, api.nvim_buf_get_extmark_by_id(buf, ns, mark, {}))
+    end)
+    eq(1, eval('g:closed'))
+  end)
+
+  it('reflows after a PTY process exits', function()
+    command('autocmd TermClose * let g:exit_status = v:event.status')
+    n.fn.jobstart({ testprg('shell-test'), 'REP', '1', text }, { term = true })
+    retry(nil, nil, function()
+      eq(0, eval('get(g:, "exit_status", -1)'))
+    end)
+    local buf = api.nvim_get_current_buf()
+    screen:try_resize(70, 10)
+    retry(nil, nil, function()
+      eq({ '0: ' .. text }, contents(buf))
+    end)
+  end)
+
+  for name, edit in pairs({
+    replacement = { 0, 1, { 'edited output' } },
+    insertion = { -1, -1, { 'annotation' } },
+    deletion = { 0, -1, { 'remaining output' } },
+  }) do
+    it('preserves buffer ' .. name, function()
+      local buf = close_terminal(text .. '\r\n')
+      api.nvim_set_option_value('modifiable', true, { buf = buf })
+      api.nvim_buf_set_lines(buf, edit[1], edit[2], true, edit[3])
+      api.nvim_set_option_value('modifiable', false, { buf = buf })
+      local before = api.nvim_buf_get_lines(buf, 0, -1, true)
+      screen:try_resize(70, 10)
+      command('sleep 20m')
+      eq(before, api.nvim_buf_get_lines(buf, 0, -1, true))
+    end)
+  end
+
+  it('preserves edits made before a pending resize is refreshed', function()
+    local buf = close_terminal(text .. '\r\n')
+    exec_lua([[
+      vim.o.columns = 70
+      vim.bo.modifiable = true
+      vim.api.nvim_buf_set_lines(0, 0, -1, true, { 'edited output' })
+      vim.bo.modifiable = false
+    ]])
+    command('sleep 20m')
+    eq({ 'edited output' }, api.nvim_buf_get_lines(buf, 0, -1, true))
+  end)
+
+  it('preserves a closed alternate screen when the window shrinks', function()
+    screen:try_resize(70, 10)
+    local buf = close_terminal('\027[?1049h' .. text .. '\r\n')
+    local before = api.nvim_buf_get_lines(buf, 0, -1, true)
+    screen:try_resize(20, 10)
+    command('sleep 20m')
+    eq(before, api.nvim_buf_get_lines(buf, 0, -1, true))
+    screen:try_resize(70, 10)
+    command('sleep 20m')
+    eq(before, api.nvim_buf_get_lines(buf, 0, -1, true))
+  end)
+
+  it('reflows when the process leaves synchronized output enabled', function()
+    local buf = close_terminal('\027[?2026h' .. text .. '\r\n')
+    screen:try_resize(70, 10)
+    retry(nil, nil, function()
+      eq({ text }, contents(buf))
+    end)
+  end)
+
+  it('preserves full-width rows when shrinking into scrollback', function()
+    screen:try_resize(70, 10)
+    local buf = close_terminal((text .. '\r\n'):rep(8))
+    eq(text:rep(8), table.concat(contents(buf)))
+    screen:try_resize(20, 4)
+    command('sleep 20m')
+    eq(text:rep(8), table.concat(contents(buf)))
+  end)
+
+  it('does not pop and truncate retained scrollback', function()
+    screen:try_resize(70, 4)
+    local buf = close_terminal((text .. '\r\n'):rep(8))
+    eq(text:rep(8), table.concat(contents(buf)))
+    screen:try_resize(20, 10)
+    command('sleep 20m')
+    eq(text:rep(8), table.concat(contents(buf)))
+  end)
+
+  it('preserves retained output when scrollback is full', function()
+    command('set scrollback=1')
+    local buf = close_terminal((text .. '\r\n'):rep(8))
+    local before = api.nvim_buf_get_lines(buf, 0, -1, true)
+    screen:try_resize(10, 4)
+    command('sleep 20m')
+    eq(before, api.nvim_buf_get_lines(buf, 0, -1, true))
+    screen:try_resize(70, 10)
+    command('sleep 20m')
+    eq(table.concat(before), table.concat(contents(buf)))
+  end)
+
+  it('preserves edits to scrollback', function()
+    local buf = close_terminal(('history\r\n'):rep(12) .. text .. '\r\n')
+    api.nvim_set_option_value('modifiable', true, { buf = buf })
+    api.nvim_buf_set_lines(buf, 0, 1, true, { 'edited history' })
+    local before = api.nvim_buf_get_lines(buf, 0, -1, true)
+    screen:try_resize(70, 10)
+    command('sleep 20m')
+    eq(before, api.nvim_buf_get_lines(buf, 0, -1, true))
+  end)
+
+  it('does not restore a deleted exit message', function()
+    local buf = close_terminal(text .. '\r\n')
+    local ns = api.nvim_create_namespace('nvim.terminal.exitmsg')
+    api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+    screen:try_resize(70, 10)
+    retry(nil, nil, function()
+      eq({ text }, contents(buf))
+    end)
+    eq({}, api.nvim_buf_get_extmarks(buf, ns, 0, -1, {}))
+  end)
+end)
+
 describe(':terminal window', function()
   local screen
 

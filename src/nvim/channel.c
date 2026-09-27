@@ -925,7 +925,9 @@ static void term_write(const char *buf, size_t size, void *data)
 static void term_resize(uint16_t width, uint16_t height, void *data)
 {
   Channel *chan = data;
-  pty_proc_resize(&chan->stream.pty, width, height);
+  if (!chan->stream.proc.in.closed) {
+    pty_proc_resize(&chan->stream.pty, width, height);
+  }
 }
 
 static void term_resume(void *data)

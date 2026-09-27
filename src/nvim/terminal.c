@@ -42,6 +42,7 @@
 #include <string.h>
 
 #include "klib/kvec.h"
+#include "nvim/api/extmark.h"
 #include "nvim/api/private/helpers.h"
 #include "nvim/ascii_defs.h"
 #include "nvim/autocmd.h"
@@ -54,6 +55,8 @@
 #include "nvim/context.h"
 #include "nvim/cursor.h"
 #include "nvim/cursor_shape.h"
+#include "nvim/decoration.h"
+#include "nvim/decoration_provider.h"
 #include "nvim/drawline.h"
 #include "nvim/drawscreen.h"
 #include "nvim/eval.h"
@@ -65,6 +68,7 @@
 #include "nvim/event/multiqueue.h"
 #include "nvim/event/time.h"
 #include "nvim/ex_docmd.h"
+#include "nvim/extmark.h"
 #include "nvim/globals.h"
 #include "nvim/grid.h"
 #include "nvim/highlight.h"
@@ -77,6 +81,8 @@
 #include "nvim/main.h"
 #include "nvim/map_defs.h"
 #include "nvim/mark.h"
+#include "nvim/marktree.h"
+#include "nvim/marktree_defs.h"
 #include "nvim/mbyte.h"
 #include "nvim/memline.h"
 #include "nvim/memory.h"
@@ -778,10 +784,18 @@ void terminal_set_state(Terminal *term, bool suspended)
 void terminal_check_size(Terminal *term)
   FUNC_ATTR_NONNULL_ALL
 {
-  if (term->closed) {
+  if (term->destroy || (term->closed && term->in_altscreen)) {
     return;
   }
 
+  if (term->closed || resize_terminal(term)) {
+    term->pending.resize = true;
+    invalidate_terminal(term, -1, -1);
+  }
+}
+
+static bool resize_terminal(Terminal *term)
+{
   int curwidth, curheight;
   vterm_get_size(term->vt, &curheight, &curwidth);
   uint16_t width = 0;
@@ -804,13 +818,36 @@ void terminal_check_size(Terminal *term)
   // if no window displays the terminal, or such all windows are zero-height,
   // don't resize the terminal.
   if ((curheight == height && curwidth == width) || height == 0 || width == 0) {
-    return;
+    return false;
+  }
+
+  if (term->closed
+      && (((width < curwidth || height < curheight)
+           && term->sb_size - term->sb_current < (size_t)curheight)
+          || !terminal_buffer_matches(term, curheight, curwidth))) {
+    return false;
   }
 
   vterm_set_size(term->vt, height, width);
   vterm_screen_flush_damage(term->vts);
-  term->pending.resize = true;
-  invalidate_terminal(term, -1, -1);
+  return true;
+}
+
+static bool terminal_buffer_matches(Terminal *term, int height, int width)
+{
+  buf_T *buf = handle_get_buffer(term->buf_handle);
+  if (!buf || buf->b_ml.ml_line_count != (linenr_T)term->sb_current + height) {
+    return false;
+  }
+
+  for (int row = -(int)term->sb_current; row < height; row++) {
+    int cols = row < 0 ? (int)term->sb_buffer[-row - 1]->cols : width;
+    fetch_row(term, row, cols);
+    if (!strequal(term->textbuf, ml_get_buf(buf, row_to_linenr(term, row)))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 static void set_terminal_winopts(TerminalState *const s)
@@ -1765,7 +1802,7 @@ static int term_sb_pop(int cols, VTermScreenCell *cells, void *data)
 {
   Terminal *term = data;
 
-  if (!term->sb_current) {
+  if (term->closed || !term->sb_current) {
     return 0;
   }
 
@@ -2297,7 +2334,7 @@ static void invalidate_terminal(Terminal *term, int start_row, int end_row)
 
   // During synchronized output (mode 2026), accumulate damage but defer
   // the actual refresh until the synchronized update ends.
-  if (term->synchronized_output) {
+  if (term->synchronized_output && !term->closed) {
     return;
   }
 
@@ -2323,6 +2360,11 @@ static void refresh_terminal(Terminal *term)
     // Destroyed by `buf_freeall()`. Do not do anything else.
     return;
   }
+  if (term->closed && term->pending.resize && !resize_terminal(term)) {
+    term->pending.resize = false;
+    multiqueue_move_events(main_loop.events, term->pending.events);
+    return;
+  }
   linenr_T ml_before = buf->b_ml.ml_line_count;
 
   bool resized = refresh_size(term, buf);
@@ -2335,6 +2377,9 @@ static void refresh_terminal(Terminal *term)
   // Resized window may have scrolled horizontally to keep its cursor in-view using the old terminal
   // size. Reset the scroll, and let curs_columns correct it if that sends the cursor out-of-view.
   if (resized) {
+    if (term->closed) {
+      refresh_exit_message(term, buf);
+    }
     FOR_ALL_TAB_WINDOWS(tp, wp) {
       if (wp->w_buffer == buf && wp->w_leftcol != 0) {
         wp->w_leftcol = 0;
@@ -2345,6 +2390,31 @@ static void refresh_terminal(Terminal *term)
 
   // Copy pending events back to the main event queue
   multiqueue_move_events(main_loop.events, term->pending.events);
+}
+
+static void refresh_exit_message(Terminal *term, buf_T *buf)
+{
+  uint32_t ns = (uint32_t)map_get(String, int)(&namespace_ids,
+                                               STATIC_CSTR_AS_STRING("nvim.terminal.exitmsg"));
+  if (!ns) {
+    return;
+  }
+
+  int row = MIN(row_to_linenr(term, term->cursor.row), buf->b_ml.ml_line_count - 1);
+  ExtmarkInfoArray marks = extmark_get(buf, ns, 0, 0, MAXLNUM, MAXCOL, INT64_MAX,
+                                       kExtmarkVirtText, false);
+  for (size_t i = 0; i < kv_size(marks); i++) {
+    MarkTreeIter itr[1];
+    MTKey mark = marktree_lookup_ns(buf->b_marktree, ns, kv_A(marks, i).start.id, false, itr);
+    if (mt_paired(mark) || mt_invalid(mark) || mark.pos.row == row) {
+      continue;
+    }
+    decor_redraw(buf, mark.pos.row, mark.pos.row, mark.pos.col, mt_decor(mark));
+    marktree_move(buf->b_marktree, itr, row, mark.pos.col);
+    decor_redraw(buf, row, row, mark.pos.col, mt_decor(mark));
+  }
+  kv_destroy(marks);
+  decor_state_invalidate(buf);
 }
 
 static void refresh_cursor(Terminal *term, bool *cursor_visible)
@@ -2414,7 +2484,7 @@ static void refresh_timer_cb(TimeWatcher *watcher, void *data)
   set_foreach(&to_refresh, term, {
     // Skip terminals in synchronized output — they will be refreshed
     // when the synchronized update ends (mode 2026 reset).
-    if (!term->synchronized_output) {
+    if (term->closed ? term->pending.resize : !term->synchronized_output) {
       refresh_terminal(term);
     }
   });
@@ -2425,7 +2495,7 @@ static void refresh_timer_cb(TimeWatcher *watcher, void *data)
 
 static bool refresh_size(Terminal *term, buf_T *buf)
 {
-  if (!term->pending.resize || term->closed) {
+  if (!term->pending.resize) {
     return false;
   }
 
@@ -2434,7 +2504,9 @@ static bool refresh_size(Terminal *term, buf_T *buf)
   vterm_get_size(term->vt, &height, &width);
   term->invalid_start = 0;
   term->invalid_end = height;
-  term->opts.resize_cb((uint16_t)width, (uint16_t)height, term->opts.data);
+  if (!term->closed) {
+    term->opts.resize_cb((uint16_t)width, (uint16_t)height, term->opts.data);
+  }
   return true;
 }
 
@@ -2511,7 +2583,8 @@ static void refresh_scrollback(Terminal *term, buf_T *buf)
     // became full and libvterm had to push all rows up. Convert the first
     // pending scrollback row into a string and append it just above the visible
     // section of the buffer.
-    fetch_row(term, -term->sb_pending, width);
+    int cols = term->closed ? (int)term->sb_buffer[term->sb_pending - 1]->cols : width;
+    fetch_row(term, -term->sb_pending, cols);
     int buf_index = buf->b_ml.ml_line_count - old_height;
     ml_append_buf(buf, buf_index, term->textbuf, 0, false);
     appended_lines_buf(buf, buf_index, 1);
